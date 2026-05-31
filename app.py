@@ -70,9 +70,17 @@ def fetch_image(base_url: str, src: str) -> tuple[bytes, str] | None:
     if full in cache:
         return cache[full]
 
+    # Send a Referer matching the page origin so hotlink-protected images
+    # (which 403 without it) download correctly.
+    parsed = urlparse(base_url)
+    headers = {**UA,
+               "Referer": base_url,
+               "Origin": f"{parsed.scheme}://{parsed.netloc}",
+               "Accept": "image/avif,image/webp,image/png,image/*,*/*;q=0.8"}
+
     result = None
     try:
-        with httpx.Client(timeout=15, follow_redirects=True, headers=UA) as client:
+        with httpx.Client(timeout=15, follow_redirects=True, headers=headers) as client:
             resp = client.get(full)
             if resp.status_code == 200 and resp.content:
                 ext = Path(urlparse(full).path).suffix.lstrip(".").lower()
@@ -94,8 +102,9 @@ def filtered_images(result, min_score: int) -> list:
     ]
 
 
-def build_zip(results, timestamp, inc_md, inc_json, inc_images, min_score) -> bytes:
+def build_zip(results, timestamp, inc_md, inc_json, inc_images, min_score) -> tuple[bytes, int, int]:
     buf = io.BytesIO()
+    img_ok = img_fail = 0
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for r in results:
             name = slug(r.url)
@@ -113,7 +122,10 @@ def build_zip(results, timestamp, inc_md, inc_json, inc_images, min_score) -> by
                     if got:
                         data, ext = got
                         z.writestr(f"{name}/assets/images/img_{i:04d}.{ext}", data)
-    return buf.getvalue()
+                        img_ok += 1
+                    else:
+                        img_fail += 1
+    return buf.getvalue(), img_ok, img_fail
 
 
 def save_to_disk(results, folder, inc_images, min_score, timestamp) -> tuple[list, int, int]:
@@ -154,16 +166,23 @@ def save_to_disk(results, folder, inc_images, min_score, timestamp) -> tuple[lis
 
 
 # ── Crawl ─────────────────────────────────────────────────────────────────────
-async def _crawl(url, mode, max_pages, max_depth, headless, stealth, use_cache, screenshot):
+async def _crawl(url, mode, max_pages, max_depth, headless, stealth, use_cache,
+                 screenshot, scan_lazy):
     browser_cfg = BrowserConfig(headless=headless, use_managed_browser=stealth)
     cache_mode = CacheMode.ENABLED if use_cache else CacheMode.BYPASS
+    # Scroll the whole page and wait for images so lazy-loaded media is captured.
+    lazy_opts = dict(
+        scan_full_page=True, scroll_delay=0.4,
+        wait_for_images=True, delay_before_return_html=1.0,
+    ) if scan_lazy else {}
     if mode == "Deep crawl":
         run_cfg = CrawlerRunConfig(
             cache_mode=cache_mode, screenshot=screenshot,
             deep_crawl_strategy=BFSDeepCrawlStrategy(max_depth=max_depth, max_pages=max_pages),
+            **lazy_opts,
         )
     else:
-        run_cfg = CrawlerRunConfig(cache_mode=cache_mode, screenshot=screenshot)
+        run_cfg = CrawlerRunConfig(cache_mode=cache_mode, screenshot=screenshot, **lazy_opts)
     async with AsyncWebCrawler(config=browser_cfg) as crawler:
         results = await crawler.arun(url=url, config=run_cfg)
         return results if isinstance(results, list) else [results]
@@ -185,6 +204,11 @@ with st.sidebar:
     headless = st.toggle("Headless", value=True)
     stealth = st.toggle("Stealth mode", value=False, help="Slower but bypasses bot detection")
     screenshot = st.toggle("Screenshot", value=False, help="Capture full-page screenshot")
+    scan_lazy = st.toggle(
+        "Capture lazy-loaded images", value=True,
+        help="Scrolls the full page and waits for images to load. "
+             "Needed for most modern sites that lazy-load images — leave on if "
+             "images aren't being found. Slightly slower.")
 
     st.divider()
     st.subheader("Cache")
@@ -234,7 +258,7 @@ if crawl_btn:
             try:
                 results = asyncio.run(_crawl(
                     url, mode, max_pages, max_depth,
-                    headless, stealth, use_cache, screenshot))
+                    headless, stealth, use_cache, screenshot, scan_lazy))
             except Exception as e:
                 st.error(f"Crawl failed: {e}")
                 st.stop()
@@ -290,15 +314,16 @@ if data:
     with d2:
         inc_json = st.checkbox("JSON", value=True)
     with d3:
-        inc_images = st.checkbox("Images", value=False)
+        inc_images = st.checkbox("Images", value=True)
     with d4:
         if not (inc_md or inc_json or inc_images):
             st.caption("Select at least one item to download.")
             zip_bytes = b""
         else:
             with st.spinner("Preparing ZIP…"):
-                zip_bytes = build_zip(successful, timestamp,
-                                      inc_md, inc_json, inc_images, min_image_score)
+                zip_bytes, img_ok, img_fail = build_zip(
+                    successful, timestamp,
+                    inc_md, inc_json, inc_images, min_image_score)
             st.download_button(
                 "⬇ Download selected (.zip)",
                 zip_bytes,
@@ -307,6 +332,16 @@ if data:
                 use_container_width=True,
                 disabled=not zip_bytes,
             )
+            if inc_images:
+                if img_ok:
+                    st.caption(f"📷 {img_ok} image(s) packed"
+                               + (f", {img_fail} failed to download" if img_fail else ""))
+                elif img_fail:
+                    st.caption(f"⚠️ 0 images packed — all {img_fail} failed "
+                               "(site may block hotlinking or require login).")
+                else:
+                    st.caption("No images matched the filter on this page. "
+                               "Try lowering 'Min image score' to 0.")
 
     st.divider()
 
